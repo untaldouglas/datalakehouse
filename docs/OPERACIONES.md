@@ -92,6 +92,14 @@ Si algún DAG falló:
 make reset-etl     # limpia y re-dispara todos los DAGs
 ```
 
+### Consultar el snapshot de la sesión anterior
+
+Si la sesión anterior se cerró con `make session-end`, el archivo `SESSION_SNAPSHOT.md` en la raíz del proyecto contiene el estado exacto al momento del cierre:
+
+```bash
+cat SESSION_SNAPSHOT.md   # git commit, estado ETL, conteos de datos
+```
+
 ---
 
 ## 3. Verificación de Salud
@@ -702,6 +710,44 @@ value = values[i]
 RAM por tarea ≈ filas × columnas × 8 bytes × 3 (overhead PyArrow)
 mem_limit scheduler = max_tareas_paralelas × RAM_por_tarea × 1.3
 ```
+
+---
+
+## Cierre y Reanudación de Sesión
+
+### Cerrar una sesión de trabajo
+
+```bash
+make session-end
+```
+
+Realiza cuatro pasos en secuencia:
+
+1. **Detecta cambios sin commitear** — si los hay, muestra la lista y pide confirmación antes de continuar.
+2. **Genera `SESSION_SNAPSHOT.md`** — archivo en la raíz del proyecto con: fecha, commit actual, estado de los 4 DAGs (con timestamp del último run), conteos de datos en PostgreSQL e instrucciones exactas para reanudar. Se sobrescribe en cada sesión.
+3. **Detiene los servicios preservando datos** — usa `docker compose stop` (no `down`). Los volúmenes Docker (MinIO, Nessie, PostgreSQL) permanecen intactos.
+4. **Imprime las instrucciones de reanudación**.
+
+`SESSION_SNAPSHOT.md` está en `.gitignore` — es estado local de máquina, no se versiona.
+
+### Consultar estado sin cerrar
+
+```bash
+make session-status
+```
+
+Muestra el mismo resumen (git, servicios, ETL, datos) sin detener nada. Útil en cualquier momento de la sesión para tener un panorama rápido.
+
+### Reanudar después de `session-end`
+
+```bash
+cd /ruta/al/proyecto
+cat SESSION_SNAPSHOT.md   # revisar estado de la sesión anterior
+make up                   # levanta todos los servicios (datos intactos)
+make health               # confirma que todo está correcto
+```
+
+Los datos en MinIO (Parquet de Iceberg) y en PostgreSQL (capa semántica) se conservan exactamente como estaban al momento del `session-end`. No es necesario re-ejecutar el ETL a menos que hayan pasado más de 12 horas y se quieran datos frescos.
 
 ---
 

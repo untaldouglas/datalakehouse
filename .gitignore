@@ -58,3 +58,6 @@ Thumbs.db
 *.crt
 secrets/
 credentials/
+
+# Session state (generado por make session-end — estado local, no versionar)
+SESSION_SNAPSHOT.md

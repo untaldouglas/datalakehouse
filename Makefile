@@ -10,7 +10,8 @@
         nessie-reset nessie-branches nessie-tables \
         open-airflow open-minio open-dremio open-metabase open-nessie open-all \
         minio-ls clean reset build lint ps \
-        preflight validate-schemas acceptance-test
+        preflight validate-schemas acceptance-test \
+        session-end session-status
 
 # ── Configuración ────────────────────────────────────────────
 -include .env
@@ -42,6 +43,9 @@ help:
 	@echo ""
 	@echo "  NAVEGADOR"
 	@grep -E '^## open' $(MAKEFILE_LIST) | sed 's/## /    /'
+	@echo ""
+	@echo "  SESIÓN"
+	@grep -E '^## (session-end|session-status):' $(MAKEFILE_LIST) | sed 's/## /    /'
 	@echo ""
 	@echo "  MANTENIMIENTO"
 	@grep -E '^## (restart|restart-service|clean|reset|lint):' $(MAKEFILE_LIST) | sed 's/## /    /'
@@ -434,6 +438,142 @@ open-nessie:
 
 ## open-all: Abre todos los servicios en el navegador
 open-all: open-airflow open-minio open-dremio open-metabase
+
+
+# ── Gestión de sesión ────────────────────────────────────────
+#
+# session-end  : Cierre limpio de sesión de trabajo.
+#   1. Muestra resumen del estado actual (git, servicios, ETL, datos).
+#   2. Escribe un snapshot en SESSION_SNAPSHOT.md (sobrescribe cada vez).
+#   3. Detiene los servicios preservando todos los datos (docker compose stop).
+#   4. Imprime las instrucciones exactas para reanudar.
+#
+# session-status : Solo muestra el resumen sin detener nada.
+#                  Útil para consultar el estado en cualquier momento.
+#
+# Para reanudar después de session-end:
+#   cd <directorio> && make up && make health
+# ─────────────────────────────────────────────────────────────
+
+SESSION_FILE = SESSION_SNAPSHOT.md
+
+## session-status: Muestra el estado actual del proyecto sin detener servicios
+session-status:
+	@echo ""
+	@echo "╔══════════════════════════════════════════════════════╗"
+	@echo "║        Estado del Proyecto — Data Lakehouse          ║"
+	@echo "╚══════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "  Fecha:  $$(date '+%Y-%m-%d %H:%M:%S %Z')"
+	@echo "  Repo:   $$(git remote get-url origin 2>/dev/null || echo 'sin remote')"
+	@echo "  Commit: $$(git log --oneline -1 2>/dev/null)"
+	@echo "  Branch: $$(git branch --show-current 2>/dev/null)"
+	@echo ""
+	@PENDING=$$(git status --porcelain 2>/dev/null | wc -l | tr -d ' '); \
+	  if [ "$$PENDING" -gt 0 ]; then \
+	    echo "  ⚠ Cambios sin commitear: $$PENDING archivo(s)"; \
+	    git status --short 2>/dev/null | sed 's/^/    /'; \
+	  else \
+	    echo "  ✓ Working tree limpio — sin cambios pendientes"; \
+	  fi
+	@echo ""
+	@echo "  --- Servicios Docker ---"
+	@$(COMPOSE) ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | grep -v "^NAME" | sed 's/^/  /' || \
+	  echo "  (Docker no disponible)"
+	@echo ""
+	@echo "  --- ETL (última ejecución por DAG) ---"
+	@$(COMPOSE) exec -T airflow-scheduler python3 -c "\
+from airflow.models import DagRun; from airflow import settings; \
+session = settings.Session(); \
+dags = ['01_moodle_to_bronze','02_erpnext_to_bronze','03_bronze_to_silver','04_silver_to_gold']; \
+[print('  ' + ('✓' if (lambda r: r.state if r else 'none')(session.query(DagRun).filter(DagRun.dag_id==d).order_by(DagRun.execution_date.desc()).first()) == 'success' else '✗') + ' ' + d + ': ' + (lambda r: r.state + ' (' + str(r.execution_date)[:16] + ')' if r else 'sin ejecuciones')(session.query(DagRun).filter(DagRun.dag_id==d).order_by(DagRun.execution_date.desc()).first())) for d in dags]" \
+	2>/dev/null || echo "  (Airflow no disponible)"
+	@echo ""
+	@echo "  --- Datos en PostgreSQL ---"
+	@$(COMPOSE) exec -T metabase-db psql -U $${METABASE_DB_USER} -d $${SEMANTIC_DB_NAME} -t -c "\
+SELECT '  alumnos: ' || COUNT(*) FROM dim_alumno \
+UNION ALL SELECT '  kpi_financiero: ' || COUNT(*) || ' períodos' FROM kpi_financiero_mensual \
+UNION ALL SELECT '  kpi_académico:  ' || COUNT(*) || ' períodos' FROM kpi_academico_periodo;" \
+	2>/dev/null || echo "  (PostgreSQL no disponible)"
+	@echo ""
+
+## session-end: Cierre limpio de sesión — guarda snapshot, detiene servicios y muestra cómo reanudar
+session-end:
+	@echo ""
+	@echo "╔══════════════════════════════════════════════════════╗"
+	@echo "║         Cierre de Sesión — Data Lakehouse            ║"
+	@echo "╚══════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "[1/4] Verificando cambios sin commitear..."
+	@PENDING=$$(git status --porcelain 2>/dev/null | wc -l | tr -d ' '); \
+	  if [ "$$PENDING" -gt 0 ]; then \
+	    echo ""; \
+	    echo "  ⚠  Hay $$PENDING archivo(s) con cambios sin commitear:"; \
+	    git status --short 2>/dev/null | sed 's/^/     /'; \
+	    echo ""; \
+	    echo "  Commiteá los cambios antes de cerrar:"; \
+	    echo "    git add <archivos> && git commit -m 'mensaje'"; \
+	    echo "    git push"; \
+	    echo ""; \
+	    read -p "  ¿Continuar de todas formas? (yes/no): " c && [ "$$c" = "yes" ]; \
+	  else \
+	    echo "  ✓ Working tree limpio."; \
+	  fi
+	@echo ""
+	@echo "[2/4] Generando snapshot de sesión..."
+	@echo "# SESSION SNAPSHOT" > $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "Generado: $$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "## Git" >> $(SESSION_FILE)
+	@echo "- Repo:   $$(git remote get-url origin 2>/dev/null)" >> $(SESSION_FILE)
+	@echo "- Branch: $$(git branch --show-current 2>/dev/null)" >> $(SESSION_FILE)
+	@echo "- Commit: $$(git log --oneline -1 2>/dev/null)" >> $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "## Commits recientes" >> $(SESSION_FILE)
+	@git log --oneline -5 2>/dev/null | sed 's/^/- /' >> $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "## Estado ETL" >> $(SESSION_FILE)
+	@$(COMPOSE) exec -T airflow-scheduler python3 -c "\
+from airflow.models import DagRun; from airflow import settings; \
+session = settings.Session(); \
+dags = ['01_moodle_to_bronze','02_erpnext_to_bronze','03_bronze_to_silver','04_silver_to_gold']; \
+[print('- ' + d + ': ' + (lambda r: r.state + ' (' + str(r.execution_date)[:16] + ')' if r else 'sin ejecuciones')(session.query(DagRun).filter(DagRun.dag_id==d).order_by(DagRun.execution_date.desc()).first())) for d in dags]" \
+	2>/dev/null >> $(SESSION_FILE) || echo "- Airflow no disponible al cerrar" >> $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "## Datos (PostgreSQL)" >> $(SESSION_FILE)
+	@$(COMPOSE) exec -T metabase-db psql -U $${METABASE_DB_USER} -d $${SEMANTIC_DB_NAME} -t -c "\
+SELECT 'alumnos: ' || COUNT(*) FROM dim_alumno \
+UNION ALL SELECT 'kpi_financiero: ' || COUNT(*) || ' períodos' FROM kpi_financiero_mensual \
+UNION ALL SELECT 'kpi_académico: ' || COUNT(*) || ' períodos' FROM kpi_academico_periodo \
+UNION ALL SELECT 'calificaciones: ' || COUNT(*) FROM fact_calificaciones;" \
+	2>/dev/null | grep -v '^$$' | sed 's/^/- /' >> $(SESSION_FILE) || \
+	  echo "- PostgreSQL no disponible al cerrar" >> $(SESSION_FILE)
+	@echo "" >> $(SESSION_FILE)
+	@echo "## Para reanudar" >> $(SESSION_FILE)
+	@echo "\`\`\`bash" >> $(SESSION_FILE)
+	@echo "cd $$(pwd)" >> $(SESSION_FILE)
+	@echo "make up       # levanta todos los servicios" >> $(SESSION_FILE)
+	@echo "make health   # verifica que todo está correcto" >> $(SESSION_FILE)
+	@echo "\`\`\`" >> $(SESSION_FILE)
+	@echo "  ✓ Snapshot guardado en $(SESSION_FILE)"
+	@echo ""
+	@echo "[3/4] Deteniendo servicios (los datos se conservan)..."
+	@$(COMPOSE) stop 2>/dev/null && echo "  ✓ Servicios detenidos." || \
+	  echo "  (Servicios ya detenidos o Docker no disponible)"
+	@echo ""
+	@echo "[4/4] Cierre completado."
+	@echo ""
+	@echo "╔══════════════════════════════════════════════════════╗"
+	@echo "║  Sesión cerrada. Los datos están preservados.        ║"
+	@echo "╠══════════════════════════════════════════════════════╣"
+	@echo "║  Para reanudar:                                      ║"
+	@echo "║    make up      → levanta los servicios              ║"
+	@echo "║    make health  → verifica el estado                 ║"
+	@echo "║  Snapshot:                                           ║"
+	@echo "║    cat $(SESSION_FILE)                       ║"
+	@echo "╚══════════════════════════════════════════════════════╝"
+	@echo ""
 
 
 # ── Mantenimiento ────────────────────────────────────────────
