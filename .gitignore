@@ -1,0 +1,60 @@
+# ============================================================
+# Universidad Data Lakehouse - .gitignore
+# ============================================================
+
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker runtime artifacts
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log
+airflow/logs/
+
+# Data (generated — do not commit)
+data/
+tmp/
+*.parquet
+*.avro
+*.orc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Terraform / cloud
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Secrets / keys
+*.pem
+*.key
+*.crt
+secrets/
+credentials/

@@ -1,0 +1,415 @@
+version: '3.8'
+
+# ============================================================
+# Universidad Data Lakehouse
+# Stack: Moodle + ERPNext → Airflow → Nessie + MinIO (Iceberg)
+#        → Dremio → PostgreSQL Semantic → Metabase
+# ============================================================
+
+networks:
+  lakehouse-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  moodle_data:
+  moodle_db_data:
+  erpnext_db_data:
+  minio_data:
+  nessie_data:
+  dremio_data:
+  airflow_db_data:
+  airflow_logs:
+  metabase_db_data:
+
+# ============================================================
+x-airflow-common: &airflow-common
+  build:
+    context: ./pipelines
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    # Source systems
+    MOODLE_DB_HOST: moodle-db
+    MOODLE_DB_PORT: "3306"
+    MOODLE_DB_NAME: ${MOODLE_DB_NAME}
+    MOODLE_DB_USER: ${MOODLE_DB_USER}
+    MOODLE_DB_PASSWORD: ${MOODLE_DB_PASSWORD}
+    ERPNEXT_DB_HOST: erpnext-db
+    ERPNEXT_DB_PORT: "3306"
+    ERPNEXT_DB_NAME: ${ERPNEXT_DB_NAME}
+    ERPNEXT_DB_USER: ${ERPNEXT_DB_USER}
+    ERPNEXT_DB_PASSWORD: ${ERPNEXT_DB_PASSWORD}
+    # Lakehouse
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    NESSIE_URI: http://nessie:19120/api/v1
+    LAKEHOUSE_BUCKET: ${MINIO_BUCKET_LAKEHOUSE}
+    # Semantic layer
+    SEMANTIC_DB_HOST: metabase-db
+    SEMANTIC_DB_PORT: "5432"
+    SEMANTIC_DB_NAME: ${SEMANTIC_DB_NAME}
+    SEMANTIC_DB_USER: ${SEMANTIC_DB_USER}
+    SEMANTIC_DB_PASSWORD: ${SEMANTIC_DB_PASSWORD}
+    # ETL config
+    ETL_SCHEDULE_INTERVAL: ${ETL_SCHEDULE_INTERVAL}
+    ETL_LOOKBACK_HOURS: ${ETL_LOOKBACK_HOURS}
+  volumes:
+    - ./pipelines/dags:/opt/airflow/dags
+    - ./pipelines/scripts:/opt/airflow/scripts
+    - airflow_logs:/opt/airflow/logs
+  networks:
+    - lakehouse-net
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+
+services:
+
+  # ============================================================
+  # SOURCE SYSTEMS
+  # ============================================================
+
+  moodle-db:
+    image: mysql:8.0
+    container_name: moodle-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MOODLE_DB_NAME}
+      MYSQL_USER: ${MOODLE_DB_USER}
+      MYSQL_PASSWORD: ${MOODLE_DB_PASSWORD}
+    volumes:
+      - moodle_db_data:/var/lib/mysql
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    mem_limit: 512m
+    restart: unless-stopped
+
+  moodle:
+    image: bitnami/moodle:${MOODLE_VERSION}
+    container_name: moodle
+    depends_on:
+      moodle-db:
+        condition: service_healthy
+    environment:
+      MOODLE_DATABASE_HOST: moodle-db
+      MOODLE_DATABASE_PORT_NUMBER: "3306"
+      MOODLE_DATABASE_NAME: ${MOODLE_DB_NAME}
+      MOODLE_DATABASE_USER: ${MOODLE_DB_USER}
+      MOODLE_DATABASE_PASSWORD: ${MOODLE_DB_PASSWORD}
+      MOODLE_USERNAME: ${MOODLE_ADMIN_USER}
+      MOODLE_PASSWORD: ${MOODLE_ADMIN_PASSWORD}
+      MOODLE_EMAIL: ${MOODLE_ADMIN_EMAIL}
+      MOODLE_SITE_NAME: ${UNIVERSITY_NAME}
+      ALLOW_EMPTY_PASSWORD: "no"
+      PHP_MAX_INPUT_VARS: "5000"
+      PHP_MEMORY_LIMIT: 256M
+    ports:
+      - "${MOODLE_PORT}:8080"
+    volumes:
+      - moodle_data:/bitnami/moodle
+    networks:
+      - lakehouse-net
+    mem_limit: 768m
+    restart: unless-stopped
+
+  erpnext-db:
+    image: mariadb:10.6
+    container_name: erpnext-db
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --skip-character-set-client-handshake
+      --lower_case_table_names=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${ERPNEXT_DB_NAME}
+      MYSQL_USER: ${ERPNEXT_DB_USER}
+      MYSQL_PASSWORD: ${ERPNEXT_DB_PASSWORD}
+    volumes:
+      - erpnext_db_data:/var/lib/mysql
+      - ./services/erpnext/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # ============================================================
+  # DATA LAKEHOUSE LAYER
+  # ============================================================
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    mem_limit: 512m
+    restart: unless-stopped
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - lakehouse-net
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET_LAKEHOUSE} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET_BRONZE} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET_SILVER} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET_GOLD} &&
+        mc mb --ignore-existing local/nessie-data &&
+        echo 'MinIO buckets ready'
+      "
+    restart: on-failure
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:${NESSIE_VERSION}
+    container_name: nessie
+    depends_on:
+      - minio-setup
+    environment:
+      QUARKUS_PROFILE: prod
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_ROCKSDB_DATABASE_PATH: /nessie/rocksdb
+      QUARKUS_HTTP_PORT: "19120"
+    ports:
+      - "${NESSIE_PORT}:19120"
+    volumes:
+      - nessie_data:/nessie/rocksdb
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 30s
+    mem_limit: 512m
+    restart: unless-stopped
+
+  dremio:
+    image: dremio/dremio-oss:${DREMIO_VERSION}
+    container_name: dremio
+    depends_on:
+      nessie:
+        condition: service_healthy
+    environment:
+      DREMIO_MAX_MEMORY_SIZE_MB: "3072"
+      DREMIO_JAVA_EXTRA_OPTS: "-Ddremio.s3.use.path.style.requests=true -Daws.secretsmanager.ttl=60000"
+    ports:
+      - "${DREMIO_UI_PORT}:9047"
+      - "${DREMIO_JDBC_PORT}:31010"
+      - "${DREMIO_FLIGHT_PORT}:32010"
+    volumes:
+      - dremio_data:/opt/dremio/data
+      - ./services/dremio/dremio.conf:/opt/dremio/conf/dremio.conf:ro
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9047/apiv2/server_status"]
+      interval: 60s
+      timeout: 30s
+      retries: 15
+      start_period: 120s
+    mem_limit: 4g
+    restart: unless-stopped
+
+  # ============================================================
+  # ORCHESTRATION (Apache Airflow)
+  # ============================================================
+
+  airflow-db:
+    image: postgres:15-alpine
+    container_name: airflow-db
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username ${AIRFLOW_ADMIN_USER}
+          --password ${AIRFLOW_ADMIN_PASSWORD}
+          --firstname Admin
+          --lastname Universidad
+          --role Admin
+          --email admin@universidad.edu || true &&
+        echo 'Airflow initialized'
+      "
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: airflow webserver
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    mem_limit: 1g
+    restart: unless-stopped
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$(hostname)"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    mem_limit: 768m
+    restart: unless-stopped
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ============================================================
+  # ANALYTICS LAYER
+  # ============================================================
+
+  metabase-db:
+    image: postgres:15-alpine
+    container_name: metabase-db
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_USER: ${METABASE_DB_USER}
+      POSTGRES_PASSWORD: ${METABASE_DB_PASSWORD}
+    volumes:
+      - metabase_db_data:/var/lib/postgresql/data
+      - ./services/metabase/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${METABASE_DB_USER} -d metabase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+    restart: unless-stopped
+
+  metabase:
+    image: metabase/metabase:${METABASE_VERSION}
+    container_name: metabase
+    depends_on:
+      metabase-db:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: "5432"
+      MB_DB_USER: ${METABASE_DB_USER}
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_DB_HOST: metabase-db
+      MB_SITE_NAME: "${UNIVERSITY_NAME} Analytics"
+      MB_SITE_URL: "http://localhost:${METABASE_PORT}"
+      JAVA_TIMEZONE: ${TIMEZONE}
+    ports:
+      - "${METABASE_PORT}:3000"
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  # ============================================================
+  # DATA SEEDER (runs once to populate test data)
+  # ============================================================
+
+  data-seeder:
+    <<: *airflow-common
+    container_name: data-seeder
+    command: python /opt/airflow/scripts/seed_data.py
+    depends_on:
+      moodle-db:
+        condition: service_healthy
+      erpnext-db:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+      NUM_STUDENTS: ${NUM_STUDENTS}
+      UNIVERSITY_NAME: ${UNIVERSITY_NAME}
+    restart: "no"
