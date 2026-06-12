@@ -184,15 +184,32 @@ def create_dashboard(name: str, description: str, collection_id: int) -> int:
     return r.json()["id"]
 
 
+_dashboard_cards: dict = {}  # dashboard_id → list of card dicts
+
+
 def add_card_to_dashboard(dashboard_id: int, card_id: int,
                           row: int, col: int, size_x: int, size_y: int):
-    api("POST", f"/api/dashboard/{dashboard_id}/cards", json={
-        "cardId": card_id,
+    if dashboard_id not in _dashboard_cards:
+        _dashboard_cards[dashboard_id] = []
+    _dashboard_cards[dashboard_id].append({
+        "id": -(len(_dashboard_cards[dashboard_id]) + 1),
+        "card_id": card_id,
         "row": row,
         "col": col,
         "size_x": size_x,
         "size_y": size_y,
     })
+
+
+def flush_dashboard_cards(dashboard_id: int):
+    cards = _dashboard_cards.get(dashboard_id, [])
+    if not cards:
+        return
+    r = api("PUT", f"/api/dashboard/{dashboard_id}/cards", json={"cards": cards})
+    if r.status_code == 200:
+        log.info(f"  Added {len(cards)} cards to dashboard {dashboard_id}")
+    else:
+        log.warning(f"  Dashboard cards flush: {r.status_code} {r.text[:200]}")
 
 
 def create_question(name: str, db_id: int, sql: str, collection_id: int,
@@ -533,6 +550,7 @@ def build_dashboard(db_id, collection_id, dashboard_name, description, queries):
             row, col = POSITIONS[i]
             add_card_to_dashboard(dash_id, card_id, row, col, 4, 4)
 
+    flush_dashboard_cards(dash_id)
     log.info(f"Dashboard '{dashboard_name}' populated with {len(queries)} cards")
     return dash_id
 

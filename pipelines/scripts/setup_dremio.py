@@ -18,7 +18,7 @@ DREMIO_HOST = os.environ.get("DREMIO_HOST", "http://localhost:9047")
 DREMIO_USER = os.environ.get("DREMIO_ADMIN_USER", "admin")
 DREMIO_PASS = os.environ.get("DREMIO_ADMIN_PASSWORD", "Admin1234!")
 DREMIO_EMAIL = os.environ.get("DREMIO_ADMIN_EMAIL", "admin@universidad.edu")
-NESSIE_URI  = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v1")
+NESSIE_URI  = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v1").replace("/api/v1", "/api/v2")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
@@ -90,7 +90,7 @@ def add_nessie_source(token):
             "credentialType": "ACCESS_KEY",
         },
     }
-    r = api("POST", "/apiv2/source/", token, json=payload)
+    r = api("POST", "/api/v3/catalog", token, json=payload)
     if r.status_code in (200, 201):
         log.info("Nessie source 'lakehouse' created in Dremio")
     elif r.status_code == 409:
@@ -100,7 +100,7 @@ def add_nessie_source(token):
 
 
 def create_space(token, space_name: str):
-    r = api("POST", "/apiv2/space/", token, json={"entityType": "space", "name": space_name})
+    r = api("POST", "/api/v3/catalog", token, json={"entityType": "space", "name": space_name})
     if r.status_code in (200, 201):
         log.info(f"Space '{space_name}' created")
     elif r.status_code == 409:
@@ -114,7 +114,7 @@ def create_vds(token, space: str, name: str, sql: str):
         "path": [space, name],
         "sql": sql,
     }
-    r = api("POST", "/apiv2/dataset/", token, json=payload)
+    r = api("POST", "/api/v3/catalog", token, json=payload)
     if r.status_code in (200, 201):
         log.info(f"VDS '{space}.{name}' created")
     else:
@@ -140,8 +140,8 @@ def main():
             p.program_name,
             s.academic_year,
             s.enabled AS active
-        FROM lakehouse.bronze.erpnext_students s
-        LEFT JOIN lakehouse.bronze.erpnext_programs p ON s.program = p.name
+        FROM lakehouse.bronze.erpnext_students AT BRANCH "main" s
+        LEFT JOIN lakehouse.bronze.erpnext_programs AT BRANCH "main" p ON s.program = p.name
     """)
 
     create_vds(token, "analytics", "financial_summary", """
@@ -156,8 +156,8 @@ def main():
             SUM(f.outstanding_amount) AS total_pendiente,
             AVG(f.outstanding_amount) AS avg_pendiente,
             SUM(CASE WHEN f.outstanding_amount > 0 THEN 1 ELSE 0 END) AS morosos
-        FROM lakehouse.bronze.erpnext_fees f
-        GROUP BY f.program, f.academic_year, f.academic_term, f.status
+        FROM lakehouse.silver.fees AT BRANCH "main" f
+        GROUP BY f.program_code, f.academic_year, f.academic_term, f.status
     """)
 
     create_vds(token, "analytics", "grade_summary", """
@@ -170,7 +170,7 @@ def main():
             SUM(g.passed) AS num_passed,
             COUNT(*) - SUM(g.passed) AS num_failed,
             ROUND(SUM(g.passed) * 100.0 / COUNT(*), 1) AS pass_rate_pct
-        FROM lakehouse.silver.grades g
+        FROM lakehouse.silver.grades AT BRANCH "main" g
         GROUP BY g.course_code
     """)
 

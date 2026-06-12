@@ -110,7 +110,7 @@ def extract_programs(**ctx):
 
     etl_ts = _etl_ts()
     schema = Schema(
-        NestedField(1, "name",         StringType(), required=True),
+        NestedField(1, "name",         StringType()),
         NestedField(2, "program_name", StringType()),
         NestedField(3, "abbreviation", StringType()),
         NestedField(4, "department",   StringType()),

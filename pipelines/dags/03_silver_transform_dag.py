@@ -33,7 +33,7 @@ default_args = {
 }
 
 SCHEMA_SILVER_STUDENTS = Schema(
-    NestedField(1,  "student_code",   StringType(), required=True),
+    NestedField(1,  "student_code",   StringType()),
     NestedField(2,  "full_name",      StringType()),
     NestedField(3,  "gender",         StringType()),
     NestedField(4,  "date_of_birth",  StringType()),
@@ -45,7 +45,7 @@ SCHEMA_SILVER_STUDENTS = Schema(
 )
 
 SCHEMA_SILVER_FEES = Schema(
-    NestedField(1,  "fee_id",          StringType(), required=True),
+    NestedField(1,  "fee_id",          StringType()),
     NestedField(2,  "student_code",    StringType()),
     NestedField(3,  "program_code",    StringType()),
     NestedField(4,  "academic_year",   StringType()),
@@ -62,7 +62,7 @@ SCHEMA_SILVER_FEES = Schema(
 )
 
 SCHEMA_SILVER_PAYMENTS = Schema(
-    NestedField(1,  "payment_id",      StringType(), required=True),
+    NestedField(1,  "payment_id",      StringType()),
     NestedField(2,  "student_code",    StringType()),
     NestedField(3,  "payment_date",    StringType()),
     NestedField(4,  "amount",          DoubleType()),
@@ -74,7 +74,7 @@ SCHEMA_SILVER_PAYMENTS = Schema(
 )
 
 SCHEMA_SILVER_GRADES = Schema(
-    NestedField(1,  "grade_id",        StringType(), required=True),
+    NestedField(1,  "grade_id",        StringType()),
     NestedField(2,  "student_code",    StringType()),
     NestedField(3,  "course_code",     StringType()),
     NestedField(4,  "grade",           DoubleType()),
@@ -259,19 +259,37 @@ with DAG(
     max_active_runs=1,
 ) as dag:
 
+    def _latest_success(dag_id):
+        from airflow.models import DagRun
+        from airflow import settings
+        session = settings.Session()
+        run = session.query(DagRun).filter(
+            DagRun.dag_id == dag_id,
+            DagRun.state == "success",
+        ).order_by(DagRun.execution_date.desc()).first()
+        return run.execution_date if run else None
+
+    def _moodle_date(dt, **kwargs):
+        return _latest_success("01_moodle_to_bronze") or dt
+
+    def _erpnext_date(dt, **kwargs):
+        return _latest_success("02_erpnext_to_bronze") or dt
+
     wait_moodle = ExternalTaskSensor(
         task_id="wait_moodle_bronze",
         external_dag_id="01_moodle_to_bronze",
+        execution_date_fn=_moodle_date,
         mode="reschedule",
         timeout=3600,
-        poke_interval=120,
+        poke_interval=30,
     )
     wait_erpnext = ExternalTaskSensor(
         task_id="wait_erpnext_bronze",
         external_dag_id="02_erpnext_to_bronze",
+        execution_date_fn=_erpnext_date,
         mode="reschedule",
         timeout=3600,
-        poke_interval=120,
+        poke_interval=30,
     )
 
     t_students = PythonOperator(task_id="transform_students", python_callable=transform_silver_students)

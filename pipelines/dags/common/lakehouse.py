@@ -26,13 +26,13 @@ LAKEHOUSE_BUCKET = os.environ.get("LAKEHOUSE_BUCKET", "lakehouse")
 
 
 def get_catalog(branch: str = "main"):
-    """Return a PyIceberg catalog connected to Nessie + MinIO."""
+    """Return a PyIceberg REST catalog connected to Nessie 0.108.0+ Iceberg REST API."""
+    nessie_base = NESSIE_URI.replace("/api/v1", "")  # http://nessie:19120
     return load_catalog(
         "nessie",
         **{
-            "type": "nessie",
-            "uri": NESSIE_URI,
-            "ref": branch,
+            "type": "rest",
+            "uri": f"{nessie_base}/iceberg/",
             "warehouse": f"s3://{LAKEHOUSE_BUCKET}",
             "s3.endpoint": MINIO_ENDPOINT,
             "s3.access-key-id": MINIO_ACCESS_KEY,
@@ -84,7 +84,7 @@ def upsert_iceberg(catalog, table_identifier: str, df: pa.Table, schema: Schema,
 # ============================================================
 
 SCHEMA_MOODLE_USERS = Schema(
-    NestedField(1,  "user_id",       LongType(),      required=True),
+    NestedField(1,  "user_id",       LongType()),
     NestedField(2,  "username",      StringType()),
     NestedField(3,  "email",         StringType()),
     NestedField(4,  "firstname",     StringType()),
@@ -99,7 +99,7 @@ SCHEMA_MOODLE_USERS = Schema(
 )
 
 SCHEMA_MOODLE_COURSES = Schema(
-    NestedField(1,  "course_id",     LongType(),      required=True),
+    NestedField(1,  "course_id",     LongType()),
     NestedField(2,  "fullname",      StringType()),
     NestedField(3,  "shortname",     StringType()),
     NestedField(4,  "category",      LongType()),
@@ -112,7 +112,7 @@ SCHEMA_MOODLE_COURSES = Schema(
 )
 
 SCHEMA_MOODLE_GRADES = Schema(
-    NestedField(1,  "grade_id",      LongType(),      required=True),
+    NestedField(1,  "grade_id",      LongType()),
     NestedField(2,  "itemid",        LongType()),
     NestedField(3,  "userid",        LongType()),
     NestedField(4,  "rawgrade",      DoubleType()),
@@ -123,7 +123,7 @@ SCHEMA_MOODLE_GRADES = Schema(
 )
 
 SCHEMA_MOODLE_ENROLMENTS = Schema(
-    NestedField(1,  "enrol_id",      LongType(),      required=True),
+    NestedField(1,  "enrol_id",      LongType()),
     NestedField(2,  "enrolid",       LongType()),
     NestedField(3,  "userid",        LongType()),
     NestedField(4,  "status",        LongType()),
@@ -135,7 +135,7 @@ SCHEMA_MOODLE_ENROLMENTS = Schema(
 )
 
 SCHEMA_ERPNEXT_STUDENTS = Schema(
-    NestedField(1,  "name",          StringType(),    required=True),
+    NestedField(1,  "name",          StringType()),
     NestedField(2,  "student_name",  StringType()),
     NestedField(3,  "first_name",    StringType()),
     NestedField(4,  "last_name",     StringType()),
@@ -150,7 +150,7 @@ SCHEMA_ERPNEXT_STUDENTS = Schema(
 )
 
 SCHEMA_ERPNEXT_FEES = Schema(
-    NestedField(1,  "name",              StringType(),    required=True),
+    NestedField(1,  "name",              StringType()),
     NestedField(2,  "student",           StringType()),
     NestedField(3,  "student_name",      StringType()),
     NestedField(4,  "program",           StringType()),
@@ -167,7 +167,7 @@ SCHEMA_ERPNEXT_FEES = Schema(
 )
 
 SCHEMA_ERPNEXT_PAYMENTS = Schema(
-    NestedField(1,  "name",            StringType(),    required=True),
+    NestedField(1,  "name",            StringType()),
     NestedField(2,  "party",           StringType()),
     NestedField(3,  "party_name",      StringType()),
     NestedField(4,  "posting_date",    StringType()),

@@ -94,6 +94,8 @@ def materialize_financial_kpis(**ctx):
         "pending":    silver_fees["pending_amount"].to_pylist(),
         "status":     silver_fees["status"].to_pylist(),
         "is_overdue": silver_fees["is_overdue"].to_pylist(),
+        "fee_id":     silver_fees["fee_id"].to_pylist(),
+        "due_date":   silver_fees["due_date"].to_pylist(),
     }
 
     # Aggregate by program, year, month, academic period
@@ -121,7 +123,7 @@ def materialize_financial_kpis(**ctx):
     # Write to PostgreSQL semantic layer
     conn = _get_pg()
     cur = conn.cursor()
-    cur.execute("TRUNCATE TABLE kpi_financiero_mensual RESTART IDENTITY")
+    cur.execute("TRUNCATE TABLE kpi_financiero_mensual")
 
     rows = []
     now = datetime.utcnow().isoformat()
@@ -163,7 +165,7 @@ def materialize_financial_kpis(**ctx):
     """, rows)
 
     # Also populate fact_ingresos_matricula from silver fees (sample)
-    cur.execute("TRUNCATE TABLE fact_ingresos_matricula RESTART IDENTITY")
+    cur.execute("TRUNCATE TABLE fact_ingresos_matricula")
     fee_rows = []
     for i in range(min(len(fees_data["student"]), 50000)):
         fee_rows.append((
@@ -171,14 +173,14 @@ def materialize_financial_kpis(**ctx):
             fees_data["program"][i] or "UNK",
             fees_data["acad_year"][i] or "",
             fees_data["acad_term"][i] or "",
-            "Colegiatura" if "FEES" in str(silver_fees["fee_id"][i]) else "Matrícula",
+            "Colegiatura" if "FEES" in str(fees_data["fee_id"][i]) else "Matrícula",
             fees_data["total"][i] or 0,
             fees_data["paid"][i] or 0,
             fees_data["pending"][i] or 0,
             "Efectivo",
             fees_data["status"][i] or "Unpaid",
             0,
-            silver_fees["due_date"][i],
+            fees_data["due_date"][i],
             now,
         ))
 
@@ -244,7 +246,7 @@ def materialize_academic_kpis(**ctx):
 
     conn = _get_pg()
     cur = conn.cursor()
-    cur.execute("TRUNCATE TABLE kpi_academico_periodo RESTART IDENTITY")
+    cur.execute("TRUNCATE TABLE kpi_academico_periodo")
 
     rows = []
     now = datetime.utcnow().isoformat()
@@ -278,7 +280,7 @@ def materialize_academic_kpis(**ctx):
     """, rows)
 
     # Populate fact_calificaciones
-    cur.execute("TRUNCATE TABLE fact_calificaciones RESTART IDENTITY")
+    cur.execute("TRUNCATE TABLE fact_calificaciones")
     grade_rows = []
     for i in range(min(n, 50000)):
         student = grades_data["student"][i]
@@ -336,7 +338,7 @@ def materialize_student_dimensions(**ctx):
     psycopg2.extras.execute_values(cur, """
         INSERT INTO dim_alumno
           (alumno_codigo, nombre_completo, genero, fecha_nacimiento,
-           fecha_ingreso, programa_codigo, anio_academico, estado, updated_at)
+           fecha_ingreso, programa_codigo, anio_academico, estado)
         VALUES %s
         ON CONFLICT (alumno_codigo) DO UPDATE SET
           nombre_completo = EXCLUDED.nombre_completo,
@@ -375,12 +377,23 @@ with DAG(
     max_active_runs=1,
 ) as dag:
 
+    def _latest_silver(dt, **kwargs):
+        from airflow.models import DagRun
+        from airflow import settings
+        session = settings.Session()
+        run = session.query(DagRun).filter(
+            DagRun.dag_id == "03_bronze_to_silver",
+            DagRun.state == "success",
+        ).order_by(DagRun.execution_date.desc()).first()
+        return run.execution_date if run else dt
+
     wait_silver = ExternalTaskSensor(
         task_id="wait_silver_transform",
         external_dag_id="03_bronze_to_silver",
+        execution_date_fn=_latest_silver,
         mode="reschedule",
         timeout=3600,
-        poke_interval=120,
+        poke_interval=30,
     )
 
     t_dims     = PythonOperator(task_id="materialize_student_dims",   python_callable=materialize_student_dimensions)
