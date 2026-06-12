@@ -9,7 +9,8 @@
         iceberg-tables semantic-check \
         nessie-reset nessie-branches nessie-tables \
         open-airflow open-minio open-dremio open-metabase open-nessie open-all \
-        minio-ls clean reset build lint ps
+        minio-ls clean reset build lint ps \
+        preflight validate-schemas acceptance-test
 
 # ── Configuración ────────────────────────────────────────────
 -include .env
@@ -29,6 +30,9 @@ help:
 	@echo ""
 	@echo "  INICIO"
 	@grep -E '^## (up|down|bootstrap|check-env|build|status|health|ps):' $(MAKEFILE_LIST) | sed 's/## /    /'
+	@echo ""
+	@echo "  CALIDAD — ejecutar en orden antes de desarrollar DAGs"
+	@grep -E '^## (preflight|validate-schemas|acceptance-test):' $(MAKEFILE_LIST) | sed 's/## /    /'
 	@echo ""
 	@echo "  DATOS"
 	@grep -E '^## (seed|setup-dremio|setup-metabase|trigger-etl|reset-etl|etl-status|wait-etl|iceberg-tables|semantic-check):' $(MAKEFILE_LIST) | sed 's/## /    /'
@@ -151,6 +155,39 @@ logs:
 logs-service:
 	@test -n "$(s)" || (echo "ERROR: especifica el servicio con s=<nombre>" && exit 1)
 	$(COMPOSE) logs -f --tail=200 $(s)
+
+
+# ── Calidad y Validación ─────────────────────────────────────
+
+## preflight: Valida conectividad e integración de todos los servicios antes de desarrollar
+# Verifica: MinIO, Nessie REST catalog, PyIceberg round-trip, Dremio API v3, Metabase, PostgreSQL permisos
+# Ejecutar siempre después de 'make up' y antes de escribir cualquier DAG
+preflight:
+	@echo ""
+	@echo "→ Ejecutando pre-flight checks..."
+	@$(COMPOSE) exec -T airflow-scheduler python3 /opt/airflow/scripts/preflight_check.py
+	@echo ""
+
+## validate-schemas: Verifica que todos los schemas Iceberg son compatibles con PyArrow
+# Confirma: sin required=True, conversión a PyArrow exitosa, round-trip con datos reales
+# Ejecutar después de modificar schemas en lakehouse.py o DAGs
+validate-schemas:
+	@echo ""
+	@echo "→ Validando schemas Iceberg ↔ PyArrow..."
+	@$(COMPOSE) exec -T airflow-scheduler python3 /opt/airflow/scripts/validate_schemas.py
+	@echo ""
+
+## acceptance-test: Validación end-to-end del stack completo post-bootstrap
+# Verifica: tablas Iceberg, KPIs en PostgreSQL, Dremio source, Metabase dashboards
+# Ejecutar después de 'make bootstrap' para confirmar que todo funciona
+acceptance-test:
+	@echo ""
+	@echo "→ Ejecutando acceptance tests (validación end-to-end)..."
+	@$(COMPOSE) exec -T -e DREMIO_HOST=http://dremio:9047 \
+	             -e METABASE_HOST=http://metabase:3000 \
+	             airflow-scheduler \
+	             python3 /opt/airflow/scripts/acceptance_test.py
+	@echo ""
 
 
 # ── Datos y ETL ──────────────────────────────────────────────
@@ -311,7 +348,7 @@ nessie-reset:
 
 # ── Inicio rápido completo ────────────────────────────────────
 
-## bootstrap: Primera puesta en marcha completa (up + seed + ETL + Dremio + Metabase)
+## bootstrap: Primera puesta en marcha completa (up + preflight + seed + ETL + Dremio + Metabase + acceptance-test)
 # Ejecutar una sola vez después de 'cp .env.example .env && make gen-keys'
 bootstrap: check-env
 	@echo ""
@@ -319,10 +356,10 @@ bootstrap: check-env
 	@echo "║   Universidad Data Lakehouse — Bootstrap Completo   ║"
 	@echo "╚══════════════════════════════════════════════════════╝"
 	@echo ""
-	@echo "[1/6] Iniciando servicios..."
+	@echo "[1/8] Iniciando servicios..."
 	$(COMPOSE) up -d --build
 	@echo ""
-	@echo "[2/6] Esperando a que todos los servicios estén saludables (máx. 5 min)..."
+	@echo "[2/8] Esperando a que todos los servicios estén saludables (máx. 5 min)..."
 	@for svc in airflow-webserver airflow-scheduler nessie dremio metabase; do \
 	  echo "  Esperando $$svc..."; \
 	  for i in $$(seq 1 30); do \
@@ -333,20 +370,31 @@ bootstrap: check-env
 	  done; \
 	done
 	@echo ""
-	@echo "[3/6] Cargando datos de prueba ($(NUM_STUDENTS) alumnos)..."
+	@echo "[3/8] Pre-flight check (validación de integraciones)..."
+	@$(COMPOSE) exec -T airflow-scheduler python3 /opt/airflow/scripts/preflight_check.py || \
+	  (echo "" && echo "ERROR: Pre-flight fallido — revisar servicios antes de continuar." && exit 1)
+	@echo ""
+	@echo "[4/8] Cargando datos de prueba ($(NUM_STUDENTS) alumnos)..."
 	$(COMPOSE) run --rm data-seeder python /opt/airflow/scripts/seed_data.py
 	@echo ""
-	@echo "[4/6] Ejecutando pipeline ETL completo..."
+	@echo "[5/8] Ejecutando pipeline ETL completo..."
 	@$(MAKE) trigger-etl
 	@echo "  (Esperando 60 segundos para que los DAGs inicien...)"
 	@sleep 60
 	@$(MAKE) wait-etl
 	@echo ""
-	@echo "[5/6] Configurando Dremio..."
+	@echo "[6/8] Configurando Dremio..."
 	$(PYTHON_RUN) /opt/airflow/scripts/setup_dremio.py
 	@echo ""
-	@echo "[6/6] Configurando Metabase..."
+	@echo "[7/8] Configurando Metabase..."
 	python3 metabase/setup/configure_metabase.py
+	@echo ""
+	@echo "[8/8] Acceptance test (validación end-to-end)..."
+	@$(COMPOSE) exec -T -e DREMIO_HOST=http://dremio:9047 \
+	             -e METABASE_HOST=http://metabase:3000 \
+	             airflow-scheduler \
+	             python3 /opt/airflow/scripts/acceptance_test.py || \
+	  echo "  ADVERTENCIA: Algunos checks fallaron — ver 'make acceptance-test' para detalle."
 	@echo ""
 	@echo "╔══════════════════════════════════════════════════════╗"
 	@echo "║              Bootstrap completado                    ║"

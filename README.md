@@ -66,8 +66,8 @@
 
 ```bash
 # 1. Clonar
-git clone https://github.com/tu-usuario/universidad-datalakehouse.git
-cd universidad-datalakehouse
+git clone https://github.com/untaldouglas/datalakehouse.git
+cd datalakehouse
 
 # 2. Configurar entorno
 cp .env.example .env
@@ -111,6 +111,11 @@ Al finalizar verás las URLs y credenciales de acceso.
 make health            # Resumen completo: servicios + tablas + KPIs
 make status            # Estado de los contenedores Docker
 make etl-status        # Estado de las últimas ejecuciones de los 4 DAGs
+
+# Calidad — ejecutar en orden antes de desarrollar DAGs
+make preflight         # Valida conectividad e integración de todos los servicios
+make validate-schemas  # Verifica que los schemas Iceberg son compatibles con PyArrow
+make acceptance-test   # Validación end-to-end del stack completo post-bootstrap
 
 # Pipeline ETL
 make trigger-etl       # Dispara los 4 DAGs manualmente

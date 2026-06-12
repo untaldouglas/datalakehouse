@@ -16,6 +16,7 @@ Guía práctica para operar el Universidad Data Lakehouse en el día a día.
 8. [Copias de seguridad](#8-copias-de-seguridad)
 9. [Actualización de componentes](#9-actualización-de-componentes)
 10. [Agregar una nueva fuente de datos](#10-agregar-una-nueva-fuente-de-datos)
+11. [Proceso de desarrollo — validaciones previas](#11-proceso-de-desarrollo--validaciones-previas)
 
 ---
 
@@ -564,6 +565,142 @@ make logs                # logs de todos los servicios
 make logs-service s=X    # logs de un servicio (X=nessie, dremio…)
 make nessie-branches     # ramas del catálogo
 make minio-ls            # objetos en MinIO
+```
+
+---
+
+---
+
+## 11. Proceso de Desarrollo — Validaciones Previas
+
+Esta sección describe el proceso correcto para extender el stack con nuevas tablas, fuentes o DAGs, basado en las lecciones aprendidas durante la integración inicial. Ver también `docs/STACK.md` y `docs/RETRO_DEVOPS.md`.
+
+### El problema que resuelve este proceso
+
+Sin validaciones previas, los errores de integración se descubren en runtime (mientras un DAG falla a mitad de ejecución), lo que requiere resetear estado de Nessie, borrar tablas mal creadas y re-ejecutar pipelines completos. Las validaciones previas detectan estos problemas antes de escribir una sola línea de código de DAG.
+
+### Paso 1 — Completar la Matriz de Compatibilidad (`docs/STACK.md`)
+
+Antes de cualquier desarrollo, verificar que las versiones del stack y sus restricciones están documentadas. Abrir `docs/STACK.md` y confirmar que:
+
+- Las versiones de imagen Docker están fijadas (sin `latest`)
+- Las restricciones conocidas del stack están documentadas
+- El bloque de "contexto para IA" está actualizado
+
+Si se agrega un nuevo componente, revisar su changelog buscando "breaking changes" antes de seleccionar la versión.
+
+### Paso 2 — Pre-flight Check
+
+```bash
+# Levantar servicios (si no están corriendo):
+make up
+
+# Ejecutar validación de conectividad e integración:
+make preflight
+```
+
+`make preflight` ejecuta `pipelines/scripts/preflight_check.py` dentro del scheduler de Airflow. Valida:
+
+| Check | Qué confirma |
+|---|---|
+| MinIO alcanzable | El objeto storage responde |
+| MinIO bucket existe | El bucket `lakehouse` fue creado |
+| Nessie API v2 | El catálogo Nessie responde en `/api/v2` |
+| Nessie REST Iceberg | Expone `/iceberg/v1/config` — requerido por PyIceberg 0.7.x |
+| PyIceberg round-trip | Crea tabla, escribe fila, lee fila, borra tabla — ciclo completo |
+| Dremio API v3 | Login y acceso a `/api/v3/catalog` |
+| Metabase login | Credenciales válidas |
+| PostgreSQL accesible | BD `universidad_analytics` responde |
+| analytics: permisos tablas | El usuario puede hacer SELECT/INSERT |
+| analytics: permisos secuencias | El usuario puede usar SERIAL/IDENTITY — sin esto falla el Gold DAG |
+
+**Regla**: si cualquier check falla, resolver antes de continuar. No escribir código de DAG con checks rojos.
+
+### Paso 3 — Validar Schemas Iceberg
+
+```bash
+make validate-schemas
+```
+
+Ejecuta `pipelines/scripts/validate_schemas.py`. Para cada schema definido en `common/lakehouse.py` y en los DAGs Silver verifica:
+
+- Ningún `NestedField` tiene `required=True` (causa el error `Mismatch in fields` en runtime)
+- El schema se convierte a PyArrow sin error
+- Un round-trip con datos reales (incluyendo `None`) funciona
+
+Ejecutar este check cada vez que se modifiquen schemas.
+
+### Paso 4 — Pipeline Vertical Mínimo
+
+Antes de implementar el pipeline completo para una nueva fuente, implementar el camino completo para **una sola tabla**:
+
+```
+Bronze (1 tabla) → Silver (1 tabla) → Gold (1 registro en PostgreSQL)
+       ↓                  ↓
+  make iceberg-tables   make semantic-check
+```
+
+Solo cuando ese camino funciona end-to-end, escalar a las tablas restantes.
+
+### Paso 5 — Acceptance Test
+
+```bash
+make acceptance-test
+```
+
+Ejecuta `pipelines/scripts/acceptance_test.py`. Valida el stack completo:
+
+| Sección | Checks |
+|---|---|
+| Iceberg / Nessie | ≥ 8 tablas bronze, ≥ 4 tablas silver, datos presentes |
+| PostgreSQL | dim_alumno, kpi_financiero, kpi_academico, fact_ingresos pobladas |
+| Dremio | Fuente `lakehouse` configurada, espacio `analytics` con vistas |
+| Metabase | BD conectada, ≥ 2 dashboards creados |
+
+`make bootstrap` ejecuta `acceptance-test` automáticamente como último paso.
+
+### Diseño de DAGs — Reglas de Oro
+
+**Regla 1: Schemas Iceberg sin `required=True`**
+```python
+# ❌ Incorrecto — causa Mismatch en runtime:
+NestedField(1, "student_code", StringType(), required=True)
+
+# ✅ Correcto:
+NestedField(1, "student_code", StringType())
+```
+
+**Regla 2: ExternalTaskSensor siempre con `execution_date_fn`**
+```python
+# ❌ Incorrecto — queda bloqueado con triggers manuales:
+ExternalTaskSensor(external_dag_id="upstream_dag")
+
+# ✅ Correcto — busca el último run exitoso:
+def _latest(dt, **kwargs):
+    from airflow.models import DagRun, settings
+    session = settings.Session()
+    run = session.query(DagRun).filter(
+        DagRun.dag_id == "upstream_dag", DagRun.state == "success"
+    ).order_by(DagRun.execution_date.desc()).first()
+    return run.execution_date if run else dt
+
+ExternalTaskSensor(external_dag_id="upstream_dag", execution_date_fn=_latest)
+```
+
+**Regla 3: Convertir PyArrow a Python antes de psycopg2**
+```python
+# ❌ Incorrecto — psycopg2 no puede serializar PyArrow scalars:
+value = df["column"][i]
+
+# ✅ Correcto — convertir a lista Python primero:
+values = df["column"].to_pylist()
+value = values[i]
+```
+
+**Regla 4: Estimar memoria antes de configurar paralelismo**
+```
+RAM por tarea ≈ filas × columnas × 8 bytes × 3 (overhead PyArrow)
+mem_limit scheduler = max_tareas_paralelas × RAM_por_tarea × 1.3
 ```
 
 ---
